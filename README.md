@@ -1,2 +1,3 @@
-# opencode-plugins
+# About this project
+
 Some OpenCode plugins i needed for my personnal usage, may be useful for others

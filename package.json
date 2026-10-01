@@ -1,0 +1,17 @@
+{
+  "name": "jeckyhl-opencode-plugins",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test plugins/test/overcome-native-apply-patch-tool-defects.test.mjs",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.7",
+    "@types/node": "^24.19.0",
+    "typescript": "^7.0.2"
+  }
+}

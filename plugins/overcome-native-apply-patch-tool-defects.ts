@@ -1,3 +1,4 @@
+import type { Plugin } from "@opencode-ai/plugin"
 import { readFile, realpath, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
@@ -12,12 +13,17 @@ const MAX_FILE_BYTES = 8 * 1024 * 1024
 // tool's resulting BOM as-is; do not restore a BOM that the tool removed.
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
 
-function inside(root, file) {
+type TextFile = { actual: string; content: string }
+type LineLayout = { eol: "\r\n" | "\n"; hasFinalNewline: boolean }
+type PatchTarget = { source: string; target: string }
+type Snapshot = LineLayout & { target: string }
+
+function inside(root: string, file: string): boolean {
   const relative = path.relative(root, file)
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
 }
 
-async function readText(file, root) {
+async function readText(file: string, root: string): Promise<TextFile | undefined> {
   const actual = await realpath(file)
   if (!inside(root, actual)) return // Includes symlinks through parent directories.
   const info = await stat(actual)
@@ -31,7 +37,7 @@ async function readText(file, root) {
   }
 }
 
-function layout(text) {
+function layout(text: string): LineLayout | undefined {
   const crlf = text.includes("\r\n")
   const lf = /(?<!\r)\n/.test(text)
   const normalized = text.replace(/\r\n/g, "\n")
@@ -43,14 +49,14 @@ function layout(text) {
   }
 }
 
-function targets(patchText, directory) {
+function targets(patchText: string, directory: string): PatchTarget[] {
   // for an presentation of the opencode patch format, see:
   // https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/apply_patch.txt
   const lines = patchText.trim().split("\n")
   const begin = lines.findIndex((line) => line.trim() === "*** Begin Patch")
   const end = lines.findIndex((line) => line.trim() === "*** End Patch")
   if (begin < 0 || end <= begin) return []
-  const result = new Map()
+  const result = new Map<string, PatchTarget>()
   for (let i = begin + 1; i < end; i++) {
     const line = lines[i]
     if (line.startsWith("*** Update File:")) {
@@ -73,16 +79,16 @@ function targets(patchText, directory) {
   return [...result.values()]
 }
 
-export default async function preserveLineEndings({ directory, worktree, client }) {
+const preserveLineEndings: Plugin = async ({ directory, worktree, client }) => {
   const root = await realpath(worktree)
   const lexicalRoot = path.resolve(worktree)
   const base = path.resolve(directory)
   // Windows may supply an 8.3 worktree path. Accept both spellings, then check
   // the actual file against the canonical root in readText.
-  const inWorktree = (file) => inside(root, file) || inside(lexicalRoot, file)
-  const relativePath = (file) => path.relative(inside(root, file) ? root : lexicalRoot, file)
-  const pending = new Map()
-  const log = async (message) => {
+  const inWorktree = (file: string) => inside(root, file) || inside(lexicalRoot, file)
+  const relativePath = (file: string) => path.relative(inside(root, file) ? root : lexicalRoot, file)
+  const pending = new Map<string, Snapshot[]>()
+  const log = async (message: string) => {
     try {
       await client.app.log({ body: { service: "preserve-line-endings", level: "error", message } })
     } catch {
@@ -93,7 +99,7 @@ export default async function preserveLineEndings({ directory, worktree, client 
   return {
     "tool.execute.before": async (input, output) => {
       if (input.tool !== "apply_patch" || typeof output.args?.patchText !== "string") return
-      const entries = []
+      const entries: Snapshot[] = []
       for (const { source, target } of targets(output.args.patchText, base)) {
         // This hook precedes permission checks; limit reads to the worktree.
         if (!inWorktree(source) || !inWorktree(target)) continue
@@ -114,8 +120,8 @@ export default async function preserveLineEndings({ directory, worktree, client 
       const key = `${input.sessionID}:${input.callID}`
       const entries = pending.get(key) ?? []
       pending.delete(key)
-      const corrected = []
-      const errors = []
+      const corrected: string[] = []
+      const errors: string[] = []
       for (const entry of entries) {
         try {
           // Recheck the destination: a move may follow a symlink out of the worktree.
@@ -156,3 +162,5 @@ export default async function preserveLineEndings({ directory, worktree, client 
     },
   }
 }
+
+export default preserveLineEndings

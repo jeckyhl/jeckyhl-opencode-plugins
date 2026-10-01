@@ -8,8 +8,6 @@ To use a plugin, just copy the `.js` file in the `plugins` directory of this rep
 
 ## Plugins list
 
-Only one as of today!
-
 ### overcome-native-apply-patch-tool-defects
 
 > This plugin addresses the limitations of Opencode's apply_patch tool:

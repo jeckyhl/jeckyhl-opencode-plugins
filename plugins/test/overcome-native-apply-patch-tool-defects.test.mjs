@@ -3,14 +3,11 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { fileURLToPath } from "node:url"
-import { dirname } from "node:path"
+import preserveLineEndings from "../overcome-native-apply-patch-tool-defects.ts"
 
-// Run: node --test overcome-native-apply-patch-tool-defects.mjs
+// Run from the repository root: npm test
+// Node.js 24+ loads the TypeScript plugin directly using native type stripping.
 
-const test_target_filename = "overcome-native-apply-patch-tool-defects.js"
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const { default: preserveLineEndings } = await import(`file://${__dirname}/../${test_target_filename}`)
 const temporary = path.join(tmpdir(), "opencode")
 const bom = Buffer.from([0xef, 0xbb, 0xbf])
 // for an presentation of the opencode patch format, see:

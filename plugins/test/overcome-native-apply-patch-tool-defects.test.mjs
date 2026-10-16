@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { test } from "node:test"
+import { Error as ToolError } from "@opencode/plugin/promise/tool"
 import preserveLineEndings from "../overcome-native-apply-patch-tool-defects.ts"
 
 // Run from the repository root: npm test
@@ -15,28 +16,78 @@ const bom = Buffer.from([0xef, 0xbb, 0xbf])
 const update = (file = "file.txt") => `*** Update File: ${file}\n@@\n-old\n+new`
 const patch = (...sections) => ["*** Begin Patch", ...sections, "*** End Patch"].join("\n")
 
-async function fixture(run, log = async () => {}) {
+async function fixture(run) {
   await mkdir(temporary, { recursive: true })
   const directory = await mkdtemp(path.join(temporary, "line-endings-"))
+  let cleanup
   try {
-    const plugin = await preserveLineEndings({
-      directory,
-      worktree: directory,
-      client: { app: { log } },
+    const hooks = new Map()
+    const events = []
+    let wake
+    let subscriptionSignal
+    let subscriptionClosed = false
+    const emit = (event) => new Promise((resolve) => {
+      events.push({ event, resolve })
+      wake?.()
     })
+    cleanup = await preserveLineEndings.setup({
+      location: { directory, project: { directory } },
+      tool: {
+        async hook(name, callback) {
+          assert.equal(hooks.has(name), false)
+          hooks.set(name, callback)
+          return { async dispose() { hooks.delete(name) } }
+        },
+      },
+      event: {
+        async *subscribe({ signal }) {
+          subscriptionSignal = signal
+          const onAbort = () => wake?.()
+          signal.addEventListener("abort", onAbort, { once: true })
+          try {
+            while (!signal.aborted) {
+              if (!events.length) await new Promise((resolve) => { wake = resolve })
+              while (!signal.aborted && events.length) {
+                const { event, resolve } = events.shift()
+                yield event
+                // Acknowledge only once the plugin has processed the event.
+                resolve()
+              }
+            }
+          } finally {
+            subscriptionClosed = true
+            signal.removeEventListener("abort", onAbort)
+          }
+        },
+      },
+    })
+    assert.deepEqual([...hooks.keys()], ["execute.before", "execute.after"])
+    assert.equal(typeof cleanup, "function")
+    const before = hooks.get("execute.before")
+    const after = hooks.get("execute.after")
+    const unload = async () => {
+      await cleanup()
+      assert.equal(subscriptionSignal.aborted, true)
+      assert.equal(subscriptionClosed, true)
+    }
     let call = 0
     // Simulate only the native tool's writes, not its parser or patch algorithm.
     // These are hook tests; native OpenCode integration needs a separate check.
-    const apply = async (patchText, nativeWrite) => {
-      const input = { tool: "apply_patch", sessionID: "test", callID: String(call++) }
-      await plugin["tool.execute.before"](input, { args: { patchText } })
+    const apply = async (patchText, nativeWrite, options = {}) => {
+      const event = {
+        tool: "patch", sessionID: "test", agent: "build", messageID: "message",
+        id: String(call++), input: { patchText },
+        ...options,
+      }
+      await before(event)
       await nativeWrite()
-      const output = { title: "Success", output: "Success", metadata: {} }
-      await plugin["tool.execute.after"]({ ...input, args: { patchText } }, output)
-      return output
+      const completed = { ...event, status: "completed", result: { content: "Success", metadata: {} } }
+      await after(completed)
+      return completed.result
     }
-    await run({ directory, apply, plugin })
+    await run({ directory, apply, before, after, emit, unload })
   } finally {
+    await cleanup?.()
     await rm(directory, { recursive: true, force: true })
   }
 }
@@ -59,7 +110,7 @@ for (const [name, before, native, expected] of [
       await writeFile(file, before)
       const result = await apply(patch(update()), () => writeFile(file, native))
       assert.equal(await readFile(file, "utf8"), expected)
-      assert.equal(result.output.includes("restored"), native !== expected)
+      assert.equal(result.content.includes("restored"), native !== expected)
     })
   })
 }
@@ -88,7 +139,7 @@ for (const eol of ["\n", "\r\n"]) {
         const expectedText = expected.replace(/\n/g, expectedEol)
         const result = await apply(patch(update()), () => writeFile(file, nativeText))
         assert.equal(await readFile(file, "utf8"), expectedText)
-        assert.equal(result.output.includes("restored"), nativeText !== expectedText)
+        assert.equal(result.content.includes("restored"), nativeText !== expectedText)
       })
     })
   }
@@ -140,7 +191,7 @@ for (const [name, before, native] of [
       await writeFile(file, before)
       const result = await apply(patch(update()), () => writeFile(file, native))
       assert.deepEqual(await readFile(file), Buffer.from(native))
-      assert.equal(result.output, "Success")
+      assert.equal(result.content, "Success")
     })
   })
 }
@@ -151,7 +202,7 @@ test("un format déjà correct ne déclenche aucune correction", async () => {
     await writeFile(file, "old\r\n")
     const result = await apply(patch(update()), () => writeFile(file, "new\r\n"))
     assert.equal(await readFile(file, "utf8"), "new\r\n")
-    assert.equal(result.output, "Success")
+    assert.equal(result.content, "Success")
   })
 })
 
@@ -173,7 +224,7 @@ test("ajouts, suppressions et mises à jour coexistent dans un patch", async () 
     assert.equal(await readFile(edited, "utf8"), "new")
     assert.equal(await readFile(added, "utf8"), "new\n")
     await assert.rejects(readFile(deleted), { code: "ENOENT" })
-    assert.doesNotMatch(result.output, /failed/)
+    assert.doesNotMatch(result.content, /failed/)
   })
 })
 
@@ -188,7 +239,7 @@ for (const operation of ["add", "delete"]) {
       )
       if (operation === "add") assert.equal(await readFile(file, "utf8"), "replacement\n")
       else await assert.rejects(readFile(file), { code: "ENOENT" })
-      assert.equal(result.output, "Success")
+      assert.equal(result.content, "Success")
     })
   })
 }
@@ -207,7 +258,7 @@ for (const [name, patchText] of [
       const result = await apply(patchText, () => writeFile(source, "first\nnew\n"))
       assert.equal(await readFile(source, "utf8"), "first\r\nnew")
       assert.equal(await readFile(unrelated, "utf8"), "untouched\n")
-      assert.match(result.output, /restored: file\.txt$/)
+      assert.match(result.content, /restored: file\.txt$/)
     })
   })
 }
@@ -235,63 +286,155 @@ test("un patch CRLF et des chemins absolus sont acceptés", async () => {
   })
 })
 
-test("les erreurs de restauration sont signalées même si la journalisation échoue", async () => {
+test("les erreurs de restauration sont signalées même si la journalisation échoue", async (t) => {
   const logs = []
+  t.mock.method(console, "error", (message) => {
+    logs.push(message)
+    throw new Error("Logger unavailable")
+  })
   await fixture(async ({ directory, apply }) => {
     const file = path.join(directory, "file.txt")
     await writeFile(file, "old")
     const result = await apply(patch(update()), () => rm(file))
-    assert.match(result.output, /restoration failed: file\.txt:/)
+    assert.match(result.content, /restoration failed: file\.txt:/)
     assert.equal(logs.length, 1)
-    assert.equal(logs[0].body.level, "error")
-  }, async (entry) => {
-    logs.push(entry)
-    throw new Error("Logger unavailable")
+    assert.match(logs[0], /^\[preserve-line-endings\] file\.txt:/)
   })
 })
 
-for (const type of ["session.idle", "session.error"]) {
+for (const type of ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.deleted"]) {
   test(`${type} nettoie uniquement les appels de la session concernée`, async () => {
-    await fixture(async ({ directory, plugin }) => {
-      const args = { patchText: patch(update()) }
-      const first = { tool: "apply_patch", sessionID: "first", callID: "same", args }
+    await fixture(async ({ directory, before, after, emit }) => {
+      const input = { patchText: patch(update()) }
+      const first = { tool: "patch", sessionID: "first", agent: "build", messageID: "message", id: "same", input }
       const second = { ...first, sessionID: "second" }
       const file = path.join(directory, "file.txt")
       await writeFile(file, "old")
-      await plugin["tool.execute.before"](first, { args })
-      await plugin["tool.execute.before"](second, { args })
-      await plugin.event({ event: { type, properties: { sessionID: first.sessionID } } })
+      await before(first)
+      await before(second)
+      await emit({ type, data: { sessionID: first.sessionID } })
       await writeFile(file, "new\n")
-      const output = { output: "Success" }
-      await plugin["tool.execute.after"](first, output)
+      const completed = { ...first, status: "completed", result: { content: "Success" } }
+      await after(completed)
       assert.equal(await readFile(file, "utf8"), "new\n")
-      assert.equal(output.output, "Success")
-      await plugin["tool.execute.after"](second, output)
+      assert.equal(completed.result.content, "Success")
+      await after({ ...second, status: "completed", result: { content: "Success" } })
       assert.equal(await readFile(file, "utf8"), "new")
       // A consumed snapshot must not affect a later write or a duplicate after hook.
       await writeFile(file, "later\n")
-      await plugin["tool.execute.after"](second, output)
+      await after({ ...second, status: "completed", result: { content: "Success" } })
       assert.equal(await readFile(file, "utf8"), "later\n")
     })
   })
 }
 
 test("deux appels entrelacés dans une session conservent leurs formats respectifs", async () => {
-  await fixture(async ({ directory, plugin }) => {
+  await fixture(async ({ directory, before, after }) => {
     const file = path.join(directory, "file.txt")
-    const args = { patchText: patch(update()) }
-    const first = { tool: "apply_patch", sessionID: "test", callID: "first", args }
-    const second = { ...first, callID: "second" }
+    const input = { patchText: patch(update()) }
+    const first = { tool: "patch", sessionID: "test", agent: "build", messageID: "message", id: "first", input }
+    const second = { ...first, id: "second" }
     await writeFile(file, "old")
-    await plugin["tool.execute.before"](first, { args })
+    await before(first)
     await writeFile(file, "old\r\n")
-    await plugin["tool.execute.before"](second, { args })
+    await before(second)
     await writeFile(file, "new\n")
-    await plugin["tool.execute.after"](second, { output: "Success" })
+    await after({ ...second, status: "completed", result: { content: "Success" } })
     assert.equal(await readFile(file, "utf8"), "new\r\n")
     await writeFile(file, "new\n")
-    await plugin["tool.execute.after"](first, { output: "Success" })
+    await after({ ...first, status: "completed", result: { content: "Success" } })
     assert.equal(await readFile(file, "utf8"), "new")
+  })
+})
+
+test("l'alias apply_patch utilise les hooks V2", async () => {
+  await fixture(async ({ directory, apply }) => {
+    const file = path.join(directory, "file.txt")
+    await writeFile(file, "old")
+    const result = await apply(patch(update()), () => writeFile(file, "new\n"), { tool: "apply_patch" })
+    assert.equal(await readFile(file, "utf8"), "new")
+    assert.match(result.content, /restored: file\.txt$/)
+  })
+})
+
+for (const [name, options] of [
+  ["outil différent", { tool: "read" }],
+  ["entrée absente", { input: undefined }],
+  ["entrée nulle", { input: null }],
+  ["patchText non textuel", { input: { patchText: 42 } }],
+]) {
+  test(`${name} : aucune restauration`, async () => {
+    await fixture(async ({ directory, apply }) => {
+      const file = path.join(directory, "file.txt")
+      await writeFile(file, "old")
+      const result = await apply(patch(update()), () => writeFile(file, "new\n"), options)
+      assert.equal(await readFile(file, "utf8"), "new\n")
+      assert.equal(result.content, "Success")
+    })
+  })
+}
+
+for (const content of [[{ type: "text", text: "Success" }], undefined]) {
+  test(`une notification est ajoutée au contenu ${content ? "structuré" : "absent"} du résultat V2`, async () => {
+    await fixture(async ({ directory, before, after }) => {
+      const file = path.join(directory, "file.txt")
+      const event = {
+        tool: "patch", sessionID: "test", agent: "build", messageID: "message",
+        id: "call", input: { patchText: patch(update()) },
+      }
+      await writeFile(file, "old")
+      await before(event)
+      await writeFile(file, "new\n")
+      const metadata = { title: "Success" }
+      const completed = { ...event, status: "completed", result: { content, metadata } }
+      await after(completed)
+      assert.equal(await readFile(file, "utf8"), "new")
+      assert.deepEqual(completed.result.content, [
+        ...(content ?? []), { type: "text", text: "\n\nLine endings restored: file.txt" },
+      ])
+      assert.equal(completed.result.metadata, metadata)
+      if (content) assert.deepEqual(content, [{ type: "text", text: "Success" }])
+    })
+  })
+}
+
+test("un appel en erreur laisse le résultat natif intact et consomme son instantané", async () => {
+  await fixture(async ({ directory, before, after }) => {
+    const file = path.join(directory, "file.txt")
+    const event = {
+      tool: "patch", sessionID: "test", agent: "build", messageID: "message",
+      id: "call", input: { patchText: patch(update()) },
+    }
+    await writeFile(file, "old")
+    await before(event)
+    await writeFile(file, "partial\n")
+    const error = new ToolError({ message: "Native tool failed" })
+    const failed = { ...event, status: "error", error }
+    await after(failed)
+    assert.equal(failed.error, error)
+    assert.equal(await readFile(file, "utf8"), "partial\n")
+    const completed = { ...event, status: "completed", result: { content: "Success" } }
+    await after(completed)
+    assert.equal(completed.result.content, "Success")
+    assert.equal(await readFile(file, "utf8"), "partial\n")
+  })
+})
+
+test("le déchargement annule l'abonnement et supprime les instantanés", async () => {
+  await fixture(async ({ directory, before, after, unload }) => {
+    const file = path.join(directory, "file.txt")
+    const event = {
+      tool: "patch", sessionID: "test", agent: "build", messageID: "message",
+      id: "call", input: { patchText: patch(update()) },
+    }
+    await writeFile(file, "old")
+    await before(event)
+    await unload()
+    await writeFile(file, "new\n")
+    const completed = { ...event, status: "completed", result: { content: "Success" } }
+    await after(completed)
+    assert.equal(await readFile(file, "utf8"), "new\n")
+    assert.equal(completed.result.content, "Success")
   })
 })
 
@@ -307,7 +450,7 @@ test("les chemins externes et les jonctions sortantes ne sont pas corrigés", as
         await writeFile(external, "old")
         const result = await apply(patch(update(target)), () => writeFile(external, "new\n"))
         assert.equal(await readFile(external, "utf8"), "new\n")
-        assert.equal(result.output, "Success")
+        assert.equal(result.content, "Success")
       }
       await writeFile(source, "old")
       const result = await apply(
@@ -318,7 +461,7 @@ test("les chemins externes et les jonctions sortantes ne sont pas corrigés", as
         },
       )
       assert.equal(await readFile(external, "utf8"), "new\n")
-      assert.equal(result.output, "Success")
+      assert.equal(result.content, "Success")
     })
   })
 })

@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import { readFile, realpath, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
@@ -79,28 +79,32 @@ function targets(patchText: string, directory: string): PatchTarget[] {
   return [...result.values()]
 }
 
-const preserveLineEndings: Plugin = async ({ directory, worktree, client }) => {
-  const root = await realpath(worktree)
-  const lexicalRoot = path.resolve(worktree)
-  const base = path.resolve(directory)
-  // Windows may supply an 8.3 worktree path. Accept both spellings, then check
-  // the actual file against the canonical root in readText.
-  const inWorktree = (file: string) => inside(root, file) || inside(lexicalRoot, file)
-  const relativePath = (file: string) => path.relative(inside(root, file) ? root : lexicalRoot, file)
-  const pending = new Map<string, Snapshot[]>()
-  const log = async (message: string) => {
-    try {
-      await client.app.log({ body: { service: "preserve-line-endings", level: "error", message } })
-    } catch {
-      // Logging must never change the outcome of a patch.
+export default Plugin.define({
+  id: "preserve-line-endings",
+  async setup(ctx) {
+    const directory = ctx.location.directory
+    const worktree = ctx.location.project.directory
+    const root = await realpath(worktree)
+    const lexicalRoot = path.resolve(worktree)
+    const base = path.resolve(directory)
+    // Windows may supply an 8.3 worktree path. Accept both spellings, then check
+    // the actual file against the canonical root in readText.
+    const inWorktree = (file: string) => inside(root, file) || inside(lexicalRoot, file)
+    const relativePath = (file: string) => path.relative(inside(root, file) ? root : lexicalRoot, file)
+    const pending = new Map<string, Snapshot[]>()
+    const log = async (message: string) => {
+      try {
+        console.error(`[preserve-line-endings] ${message}`)
+      } catch {
+        // Logging must never change the outcome of a patch.
+      }
     }
-  }
 
-  return {
-    "tool.execute.before": async (input, output) => {
-      if (input.tool !== "apply_patch" || typeof output.args?.patchText !== "string") return
+    await ctx.tool.hook("execute.before", async (event) => {
+      const input = event.input as { patchText?: unknown } | undefined
+      if ((event.tool !== "patch" && event.tool !== "apply_patch") || typeof input?.patchText !== "string") return
       const entries: Snapshot[] = []
-      for (const { source, target } of targets(output.args.patchText, base)) {
+      for (const { source, target } of targets(input.patchText, base)) {
         // This hook precedes permission checks; limit reads to the worktree.
         if (!inWorktree(source) || !inWorktree(target)) continue
         try {
@@ -112,14 +116,15 @@ const preserveLineEndings: Plugin = async ({ directory, worktree, client }) => {
           // Missing/unreadable files will be handled by the native tool.
         }
       }
-      pending.set(`${input.sessionID}:${input.callID}`, entries)
-    },
+      pending.set(`${event.sessionID}:${event.id}`, entries)
+    })
 
-    "tool.execute.after": async (input, output) => {
-      if (input.tool !== "apply_patch") return
-      const key = `${input.sessionID}:${input.callID}`
+    await ctx.tool.hook("execute.after", async (event) => {
+      if (event.tool !== "patch" && event.tool !== "apply_patch") return
+      const key = `${event.sessionID}:${event.id}`
       const entries = pending.get(key) ?? []
       pending.delete(key)
+      if (event.status !== "completed") return
       const corrected: string[] = []
       const errors: string[] = []
       for (const entry of entries) {
@@ -143,24 +148,40 @@ const preserveLineEndings: Plugin = async ({ directory, worktree, client }) => {
           errors.push(`${relativePath(entry.target)}: ${String(error)}`)
         }
       }
-      if (corrected.length) {
-        output.output += `\n\nLine endings restored: ${corrected.join(", ")}`
-      }
+      let notice = ""
+      if (corrected.length) notice += `\n\nLine endings restored: ${corrected.join(", ")}`
       if (errors.length) {
-        output.output += `\n\nLine-ending restoration failed: ${errors.join("; ")}`
+        notice += `\n\nLine-ending restoration failed: ${errors.join("; ")}`
         await log(errors.join("; "))
       }
-    },
+      if (notice) {
+        const content = event.result.content
+        event.result = {
+          ...event.result,
+          content: typeof content === "string"
+            ? content + notice
+            : [...(content ?? []), { type: "text", text: notice }],
+        }
+      }
+    })
 
-    // Failed/rejected apply_patch calls have no after hook; discard their snapshots
-    // when the session stops. Concurrent calls remain separated by session and call ID.
-    event: async ({ event }) => {
-      if (event.type !== "session.idle" && event.type !== "session.error") return
-      const sessionID = event.properties?.sessionID
-      if (!sessionID) return
-      for (const key of pending.keys()) if (key.startsWith(`${sessionID}:`)) pending.delete(key)
-    },
-  }
-}
-
-export default preserveLineEndings
+    // Discard snapshots on terminal transitions, including interrupted/rejected calls.
+    const controller = new AbortController()
+    const subscription = (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (event.type !== "session.execution.succeeded" && event.type !== "session.execution.failed"
+            && event.type !== "session.execution.interrupted" && event.type !== "session.deleted") continue
+          for (const key of pending.keys()) if (key.startsWith(`${event.data.sessionID}:`)) pending.delete(key)
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) await log(`Event subscription failed: ${String(error)}`)
+      }
+    })()
+    return async () => {
+      controller.abort()
+      pending.clear()
+      await subscription
+    }
+  },
+})
